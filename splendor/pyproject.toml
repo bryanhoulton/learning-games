@@ -1,0 +1,10 @@
+[project]
+name = "splendor"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.0.0", # used via openrouter base_url
+]
+
+[tool.uv]
+package = false
