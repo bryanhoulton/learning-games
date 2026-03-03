@@ -10,6 +10,7 @@ Set OPENROUTER_API_KEY before using it.
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import re
@@ -42,7 +43,8 @@ You are playing Splendor. Rules:
 - Development cards give a permanent gem bonus (reduces future costs) and victory points
 - Nobles automatically visit at end of turn when your card-bonus totals meet their requirements (+3 VP each)
 - If you hold >10 gems after your action you must return some to the supply
-- The first player to end a turn with ≥15 VP triggers the final round; highest VP after the round wins (tiebreak: fewer purchased cards)\
+- The first player to end a turn with ≥15 VP triggers the final round; highest VP after the round wins (tiebreak: fewer purchased cards)
+Respond with only a valid JSON object — no explanation.\
 """
 
 _STRATEGY = """\
@@ -131,8 +133,8 @@ class LLMAgent(Agent):
 
     Maintains a persistent conversation history across the entire game:
     - Game events are appended as user messages as they happen
-    - On each turn the model reasons freely, then writes ACTION: <index>
-    - Its own reasoning is preserved in the history for future turns
+    - On each turn the model responds with a JSON action object
+    - Its own responses are preserved in the history for future turns
 
     Requires OPENROUTER_API_KEY environment variable.
     """
@@ -217,7 +219,6 @@ class LLMAgent(Agent):
 
     def choose_action(self, view: PlayerView) -> Action:
         legal = _legal_actions(view)
-        actions_text = _format_actions(legal)
 
         phase_context = {
             Phase.AWAITING_DISCARD: (
@@ -233,8 +234,7 @@ class LLMAgent(Agent):
         turn_prompt = (
             f"{phase_context}\n\n"
             f"Current state:\n{_format_view(view)}\n\n"
-            f"Legal actions:\n{actions_text}\n\n"
-            f"Reason through your strategy, then on a new line write exactly: ACTION: <index>"
+            f"{_action_prompt(view, legal)}"
         )
 
         messages = self._messages + [{"role": "user", "content": turn_prompt}]
@@ -247,25 +247,14 @@ class LLMAgent(Agent):
         )
         raw = response.choices[0].message.content.strip()
 
-        # Persist the prompt and response into history
         self._messages.append({"role": "user", "content": turn_prompt})
         self._messages.append({"role": "assistant", "content": raw})
         self.last_reasoning = raw
 
-        # Parse ACTION: N
-        match = re.search(r"ACTION:\s*(\d+)", raw)
-        if match:
-            idx = int(match.group(1))
-            if 0 <= idx < len(legal):
-                return legal[idx]
-
-        # Fallback: any standalone number in range
-        for tok in re.findall(r"\d+", raw):
-            idx = int(tok)
-            if 0 <= idx < len(legal):
-                return legal[idx]
-
-        return random.choice(legal)
+        try:
+            return _parse_action(raw)
+        except (ValueError, KeyError, json.JSONDecodeError):
+            return random.choice(legal)
 
 
 # ---------------------------------------------------------------------------
@@ -512,3 +501,126 @@ def _gems_str(gems: dict) -> str:
 def _cost_str(cost: dict) -> str:
     parts = [f"{c.value[0].upper()}:{v}" for c, v in cost.items() if v > 0]
     return "{" + ", ".join(parts) + "}" if parts else "{free}"
+
+
+# ---------------------------------------------------------------------------
+# JSON extraction and parsing (structured output)
+# ---------------------------------------------------------------------------
+
+def _extract_json(raw: str) -> dict:
+    """Extract the last JSON object from a string (handles reasoning + JSON responses)."""
+    last_brace = raw.rfind("}")
+    if last_brace == -1:
+        raise ValueError(f"No JSON object found in response: {raw!r}")
+    first_brace = raw.rfind("{", 0, last_brace)
+    if first_brace == -1:
+        raise ValueError(f"No JSON object found in response: {raw!r}")
+    return json.loads(raw[first_brace : last_brace + 1])
+
+
+def _parse_action(raw: str) -> Action:
+    data = _extract_json(raw)
+    action_type = data["action_type"]
+
+    if action_type == "take_different_gems":
+        colors = tuple(GemColor(c) for c in data["colors"])
+        return TakeDifferentGems(colors)
+    elif action_type == "take_double_gem":
+        return TakeDoubleGem(GemColor(data["color"]))
+    elif action_type == "reserve_board_card":
+        return ReserveBoardCard(int(data["card_id"]))
+    elif action_type == "reserve_deck_top":
+        return ReserveDeckTop(int(data["tier"]))
+    elif action_type == "buy_card":
+        return BuyCard(int(data["card_id"]))
+    elif action_type == "discard_gems":
+        gems = {GemColor(c): int(v) for c, v in data["gems"].items()}
+        return DiscardGems(gems)
+    elif action_type == "choose_noble":
+        return ChooseNoble(int(data["noble_id"]))
+    else:
+        raise ValueError(f"Unknown action_type: {action_type!r}")
+
+
+def _action_prompt(view: PlayerView, legal: list[Action]) -> str:
+    """Build phase-specific instructions with JSON schema examples."""
+    lines: list[str] = []
+
+    if view.phase == Phase.AWAITING_DISCARD:
+        total = sum(view.your_gems.values())
+        n_return = total - 10
+        gems_str = ", ".join(
+            f'"{c.value}": {v}' for c, v in view.your_gems.items() if v > 0
+        )
+        lines.append(f"You must return {n_return} gem(s) to get down to 10.")
+        lines.append(f"Your gems: {{{gems_str}}}")
+        lines.append("")
+        lines.append(
+            'Respond with JSON: {"action_type": "discard_gems", "gems": {"color": count, ...}}'
+        )
+
+    elif view.phase == Phase.AWAITING_NOBLE_CHOICE:
+        lines.append("Multiple nobles qualify. Choose one:")
+        for nid in view.pending_noble_choices:
+            n = NOBLE_REGISTRY[nid]
+            reqs = ", ".join(f"{v} {c.value}" for c, v in n.requirements.items())
+            lines.append(f"  [{nid}] {n.vp}VP — needs {reqs}")
+        lines.append("")
+        lines.append(
+            'Respond with JSON: {"action_type": "choose_noble", "noble_id": <id>}'
+        )
+
+    else:
+        lines.append("Choose one action:")
+        lines.append("")
+
+        buyable = [a for a in legal if isinstance(a, BuyCard)]
+        if buyable:
+            lines.append(
+                'Buy a card: {"action_type": "buy_card", "card_id": <id>}'
+            )
+            lines.append("  Affordable cards:")
+            for a in buyable:
+                lines.append(f"    {_card_desc(CARD_REGISTRY[a.card_id])}")
+            lines.append("")
+
+        available = [c for c in GEM_COLORS if view.gem_supply.get(c, 0) >= 1]
+        if available:
+            colors_str = ", ".join(
+                f"{c.value} ({view.gem_supply[c]})" for c in available
+            )
+            n = min(3, len(available))
+            lines.append(
+                'Take different gems: {"action_type": "take_different_gems", '
+                '"colors": ["color1", "color2", ...]}'
+            )
+            lines.append(f"  Available (pick up to {n}): {colors_str}")
+            lines.append("")
+
+        doubles = [c for c in GEM_COLORS if view.gem_supply.get(c, 0) >= 4]
+        if doubles:
+            colors_str = ", ".join(f"{c.value} ({view.gem_supply[c]})" for c in doubles)
+            lines.append(
+                'Take 2 of same color: {"action_type": "take_double_gem", "color": "color"}'
+            )
+            lines.append(f"  Eligible (≥4 in supply): {colors_str}")
+            lines.append("")
+
+        if len(view.your_reserved) < 3:
+            lines.append(
+                'Reserve a board card: {"action_type": "reserve_board_card", "card_id": <id>}'
+            )
+            available_tiers = [
+                t for t in (1, 2, 3) if view.deck_sizes.get(t, 0) > 0
+            ]
+            if available_tiers:
+                tiers_str = ", ".join(str(t) for t in available_tiers)
+                lines.append(
+                    'Reserve from deck: {"action_type": "reserve_deck_top", '
+                    f'"tier": <{tiers_str}>}}'
+                )
+            lines.append("")
+
+        lines.append("Respond with only the JSON object.")
+
+    return "\n".join(lines)

@@ -56,8 +56,9 @@ class RouteId:
 
     def __post_init__(self) -> None:
         if self.city_a > self.city_b:
-            object.__setattr__(self, "city_a", self.city_b)
-            object.__setattr__(self, "city_b", self.city_a)
+            a, b = self.city_a, self.city_b
+            object.__setattr__(self, "city_a", b)
+            object.__setattr__(self, "city_b", a)
 
 
 @dataclass(frozen=True)

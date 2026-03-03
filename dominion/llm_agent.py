@@ -11,6 +11,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import sys
@@ -236,6 +237,192 @@ def _format_state(view: PlayerView) -> str:
 
 
 # ---------------------------------------------------------------------------
+# JSON extraction and parsing (structured output)
+# ---------------------------------------------------------------------------
+
+def _extract_json(raw: str) -> dict:
+    """Extract the last JSON object from a string (handles reasoning + JSON responses)."""
+    last_brace = raw.rfind("}")
+    if last_brace == -1:
+        raise ValueError(f"No JSON object found in response: {raw!r}")
+    first_brace = raw.rfind("{", 0, last_brace)
+    if first_brace == -1:
+        raise ValueError(f"No JSON object found in response: {raw!r}")
+    return json.loads(raw[first_brace : last_brace + 1])
+
+
+def _parse_action(raw: str, view: PlayerView) -> Action:
+    data = _extract_json(raw)
+    action_type = data["action_type"]
+
+    if action_type == "play_action":
+        return PlayAction(CardName(data["card"]))
+    elif action_type == "end_action_phase":
+        return EndActionPhase()
+    elif action_type == "play_treasure":
+        return PlayTreasure(CardName(data["card"]))
+    elif action_type == "buy_card":
+        return BuyCard(CardName(data["card"]))
+    elif action_type == "end_buy_phase":
+        return EndBuyPhase()
+    elif action_type == "resolve_cellar":
+        cards = tuple(CardName(c) for c in data.get("discard_cards", []))
+        return ResolveCellar(discard_cards=cards)
+    elif action_type == "resolve_mine_trash":
+        return ResolveMineTrash(CardName(data["card"]))
+    elif action_type == "resolve_mine_gain":
+        return ResolveMineGain(CardName(data["card"]))
+    elif action_type == "resolve_remodel_trash":
+        return ResolveRemodelTrash(CardName(data["card"]))
+    elif action_type == "resolve_remodel_gain":
+        return ResolveRemodelGain(CardName(data["card"]))
+    elif action_type == "resolve_workshop":
+        return ResolveWorkshop(CardName(data["card"]))
+    elif action_type == "resolve_militia_discard":
+        cards = tuple(CardName(c) for c in data["discard_cards"])
+        return ResolveMilitiaDiscard(discard_cards=cards)
+    else:
+        raise ValueError(f"Unknown action_type: {action_type!r}")
+
+
+def _action_prompt(view: PlayerView, legal: list[Action]) -> str:
+    """Build phase-specific instructions with JSON schema examples."""
+    lines: list[str] = []
+
+    if view.phase == Phase.ACTION:
+        playable: set[CardName] = set()
+        for card in view.your_hand:
+            defn = CARD_REGISTRY[card]
+            if CardType.ACTION in defn.types or CardType.REACTION in defn.types:
+                playable.add(card)
+
+        lines.append("=== ACTION PHASE ===")
+        lines.append(f"Actions remaining: {view.actions}")
+        lines.append("")
+        lines.append("Choose one:")
+        if playable and view.actions > 0:
+            for card in sorted(playable, key=lambda c: c.value):
+                desc = CARD_DESCRIPTIONS.get(card, "")
+                lines.append(
+                    f'  Play {card.value}: {{"action_type": "play_action", "card": "{card.value}"}}  [{desc}]'
+                )
+        lines.append(
+            '  End action phase: {"action_type": "end_action_phase"}'
+        )
+
+    elif view.phase == Phase.BUY:
+        lines.append("=== BUY PHASE ===")
+        lines.append(f"Buys: {view.buys}  Coins: {view.coins}")
+        lines.append("")
+
+        unplayed: set[CardName] = set()
+        for card in view.your_hand:
+            if CardType.TREASURE in CARD_REGISTRY[card].types:
+                unplayed.add(card)
+
+        lines.append("Choose one:")
+        if unplayed:
+            for card in sorted(unplayed, key=lambda c: CARD_REGISTRY[c].cost):
+                coins = CARD_REGISTRY[card].coins
+                lines.append(
+                    f'  Play treasure: {{"action_type": "play_treasure", "card": "{card.value}"}}  (+{coins} coin{"s" if coins != 1 else ""})'
+                )
+
+        if view.buys > 0:
+            affordable = [
+                name for name in sorted(view.supply, key=lambda n: CARD_REGISTRY[n].cost)
+                if view.supply[name] > 0 and CARD_REGISTRY[name].cost <= view.coins
+            ]
+            for name in affordable:
+                defn = CARD_REGISTRY[name]
+                desc = CARD_DESCRIPTIONS.get(name, "")
+                lines.append(
+                    f'  Buy: {{"action_type": "buy_card", "card": "{name.value}"}}  [cost {defn.cost}  {desc}]'
+                )
+
+        lines.append('  End buy phase: {"action_type": "end_buy_phase"}')
+
+    elif view.phase == Phase.AWAITING_CELLAR_DISCARD:
+        hand_list = ", ".join(c.value for c in view.your_hand)
+        lines.append("=== CELLAR ===")
+        lines.append("Discard any cards from your hand, then draw one per discarded.")
+        lines.append(f"Your hand: {hand_list}")
+        lines.append("")
+        lines.append(
+            'Respond with JSON: {"action_type": "resolve_cellar", "discard_cards": ["Card1", "Card2", ...]}'
+        )
+        lines.append('  (use empty list [] to discard nothing)')
+
+    elif view.phase == Phase.AWAITING_MILITIA_DISCARD:
+        n = len(view.your_hand) - 3
+        hand_list = ", ".join(c.value for c in view.your_hand)
+        lines.append("=== MILITIA ATTACK ===")
+        lines.append(f"You must discard exactly {n} card(s) to keep only 3.")
+        lines.append(f"Your hand: {hand_list}")
+        lines.append("")
+        lines.append(
+            '{"action_type": "resolve_militia_discard", "discard_cards": ["Card1", ...]}'
+        )
+
+    elif view.phase == Phase.AWAITING_MINE_TRASH:
+        trashable = set()
+        for card in view.your_hand:
+            if CardType.TREASURE in CARD_REGISTRY[card].types:
+                trashable.add(card)
+        lines.append("=== MINE — trash a Treasure ===")
+        for card in sorted(trashable, key=lambda c: CARD_REGISTRY[c].cost):
+            defn = CARD_REGISTRY[card]
+            lines.append(
+                f'  Trash {card.value} (cost {defn.cost}) → gain up to cost {defn.cost + 3}: '
+                f'{{"action_type": "resolve_mine_trash", "card": "{card.value}"}}'
+            )
+
+    elif view.phase == Phase.AWAITING_MINE_GAIN:
+        lines.append(f"=== MINE — gain a Treasure costing up to {view.pending_gain_max_cost} ===")
+        for name in sorted(view.supply, key=lambda n: CARD_REGISTRY[n].cost, reverse=True):
+            if (view.supply[name] > 0
+                    and CARD_REGISTRY[name].cost <= view.pending_gain_max_cost
+                    and CardType.TREASURE in CARD_REGISTRY[name].types):
+                lines.append(
+                    f'  {{"action_type": "resolve_mine_gain", "card": "{name.value}"}}  (cost {CARD_REGISTRY[name].cost})'
+                )
+
+    elif view.phase == Phase.AWAITING_REMODEL_TRASH:
+        hand_set: set[CardName] = set()
+        for card in view.your_hand:
+            hand_set.add(card)
+        lines.append("=== REMODEL — trash a card from hand ===")
+        for card in sorted(hand_set, key=lambda c: CARD_REGISTRY[c].cost):
+            defn = CARD_REGISTRY[card]
+            lines.append(
+                f'  Trash {card.value} (cost {defn.cost}) → gain up to cost {defn.cost + 2}: '
+                f'{{"action_type": "resolve_remodel_trash", "card": "{card.value}"}}'
+            )
+
+    elif view.phase == Phase.AWAITING_REMODEL_GAIN:
+        lines.append(f"=== REMODEL — gain a card costing up to {view.pending_gain_max_cost} ===")
+        for name in sorted(view.supply, key=lambda n: CARD_REGISTRY[n].cost, reverse=True):
+            if view.supply[name] > 0 and CARD_REGISTRY[name].cost <= view.pending_gain_max_cost:
+                desc = CARD_DESCRIPTIONS.get(name, "")
+                lines.append(
+                    f'  {{"action_type": "resolve_remodel_gain", "card": "{name.value}"}}  [cost {CARD_REGISTRY[name].cost}  {desc}]'
+                )
+
+    elif view.phase == Phase.AWAITING_WORKSHOP_GAIN:
+        lines.append("=== WORKSHOP — gain a card costing up to 4 ===")
+        for name in sorted(view.supply, key=lambda n: CARD_REGISTRY[n].cost, reverse=True):
+            if view.supply[name] > 0 and CARD_REGISTRY[name].cost <= 4:
+                desc = CARD_DESCRIPTIONS.get(name, "")
+                lines.append(
+                    f'  {{"action_type": "resolve_workshop", "card": "{name.value}"}}  [cost {CARD_REGISTRY[name].cost}  {desc}]'
+                )
+
+    lines.append("")
+    lines.append("Respond with only the JSON object.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # LLM Agent
 # ---------------------------------------------------------------------------
 
@@ -254,9 +441,7 @@ class LLMAgent(Agent):
         "At end of turn, discard everything and draw 5 new cards. "
         "The game ends when the Province pile or any 3 supply piles are empty. "
         "Final score = total Victory Points across all cards in your deck. "
-        "When asked to choose an action, respond with ONLY the action number (e.g. '3'). "
-        "When asked to discard cards, respond with ONLY a comma-separated list of card names "
-        "(e.g. 'Copper, Estate') or 'none' to discard nothing."
+        "Respond with only a valid JSON object — no explanation."
     )
 
     def __init__(
@@ -274,89 +459,35 @@ class LLMAgent(Agent):
         self._fallback = RandomAgent()
 
     def choose_action(self, view: PlayerView) -> Action:
-        # Always play treasures immediately — never strategically withheld in this kingdom
         if view.phase == Phase.BUY:
             treasures = [c for c in view.your_hand if CardType.TREASURE in CARD_REGISTRY[c].types]
             if treasures:
                 return PlayTreasure(treasures[0])
 
-        if view.phase in (Phase.AWAITING_CELLAR_DISCARD, Phase.AWAITING_MILITIA_DISCARD):
-            return self._multi_card_choice(view)
-        return self._single_choice(view)
-
-    # ------------------------------------------------------------------
-    # Single-choice (pick from numbered list)
-    # ------------------------------------------------------------------
-
-    def _single_choice(self, view: PlayerView) -> Action:
-        actions = get_legal_actions(view)
-        if not actions:
+        legal = get_legal_actions(view)
+        if not legal and view.phase not in (Phase.AWAITING_CELLAR_DISCARD, Phase.AWAITING_MILITIA_DISCARD):
             return self._fallback.choose_action(view)
 
         state_str = _format_state(view)
-        numbered = "\n".join(f"{i+1}. {_action_label(a)}" for i, a in enumerate(actions))
+        action_info = _action_prompt(view, legal)
 
-        prompt = (
-            f"{state_str}\n"
-            f"LEGAL ACTIONS:\n{numbered}\n\n"
-            f"Choose the number of your action:"
-        )
-
+        prompt = f"{state_str}\n{action_info}"
         raw = self._call(prompt)
 
+        if self.verbose:
+            print(f"    [LLM response: {raw[:120]}]")
+
         try:
-            idx = int(raw.strip().split()[0]) - 1
-            if 0 <= idx < len(actions):
-                if self.verbose:
-                    print(f"    [LLM chose {idx+1}: {_action_label(actions[idx])}]")
-                return actions[idx]
-        except (ValueError, IndexError):
+            action = _parse_action(raw, view)
+            return action
+        except (ValueError, KeyError, json.JSONDecodeError):
             pass
 
         if self.verbose:
-            print(f"    [LLM parse failed ({raw!r}), falling back to random]")
+            print(f"    [LLM parse failed, falling back to random]")
+        if legal:
+            return random.choice(legal)
         return self._fallback.choose_action(view)
-
-    # ------------------------------------------------------------------
-    # Multi-card choice (Cellar / Militia)
-    # ------------------------------------------------------------------
-
-    def _multi_card_choice(self, view: PlayerView) -> Action:
-        state_str = _format_state(view)
-        hand_list = ", ".join(c.value for c in view.your_hand)
-
-        if view.phase == Phase.AWAITING_MILITIA_DISCARD:
-            n = len(view.your_hand) - 3
-            prompt = (
-                f"{state_str}\n"
-                f"MILITIA ATTACK: you must discard exactly {n} card(s) to keep only 3.\n"
-                f"Your hand: {hand_list}\n\n"
-                f"List {n} card(s) to discard, separated by commas (e.g. 'Copper, Estate'):"
-            )
-            required = n
-        else:  # AWAITING_CELLAR_DISCARD
-            prompt = (
-                f"{state_str}\n"
-                f"CELLAR: discard any cards from your hand, then draw one per discarded.\n"
-                f"Your hand: {hand_list}\n\n"
-                f"List cards to discard, separated by commas, or 'none':"
-            )
-            required = None
-
-        raw = self._call(prompt)
-        cards = self._parse_card_list(raw, view.your_hand, required)
-
-        if self.verbose:
-            names = ", ".join(c.value for c in cards) if cards else "none"
-            print(f"    [LLM discards: {names}]")
-
-        if view.phase == Phase.AWAITING_MILITIA_DISCARD:
-            return ResolveMilitiaDiscard(discard_cards=tuple(cards))
-        return ResolveCellar(discard_cards=tuple(cards))
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     def _call(self, prompt: str) -> str:
         if self.verbose:
@@ -370,44 +501,8 @@ class LLMAgent(Agent):
             temperature=0.2,
         )
         if self.verbose:
-            print("\r", end="", flush=True)   # clear the "thinking" line
+            print("\r", end="", flush=True)
         return response.choices[0].message.content or ""
-
-    def _parse_card_list(
-        self,
-        raw: str,
-        hand: tuple,
-        required_count: Optional[int],
-    ) -> list[CardName]:
-        """
-        Parse a comma-separated list of card names from an LLM response.
-        Falls back to a random valid selection if parsing fails.
-        """
-        text = raw.strip().lower()
-        if text in ("none", "nothing", "0", ""):
-            if required_count and required_count > 0:
-                # Must discard something — fall back to random
-                return random.sample(list(hand), required_count)
-            return []
-
-        name_map: dict[str, CardName] = {c.value.lower(): c for c in CardName}
-        hand_copy = list(hand)
-        chosen: list[CardName] = []
-
-        for token in text.split(","):
-            token = token.strip().rstrip(".").strip()
-            if token in name_map:
-                card = name_map[token]
-                if card in hand_copy:
-                    hand_copy.remove(card)
-                    chosen.append(card)
-
-        # Validate count
-        if required_count is not None and len(chosen) != required_count:
-            # Fall back to random
-            return random.sample(list(hand), required_count)
-
-        return chosen
 
 
 # ---------------------------------------------------------------------------
